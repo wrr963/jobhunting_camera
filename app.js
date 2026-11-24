@@ -731,6 +731,10 @@ $('btnFlip').onclick = async () => {
 // ---------- 録画 ----------
 const MP4_TYPES = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a', 'video/mp4'];
 const WEBM_TYPES = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm'];
+function isAppleMobile() {
+  return /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
 function pickMimeType() {
   if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
   const ok = (t) => MediaRecorder.isTypeSupported(t);
@@ -738,9 +742,9 @@ function pickMimeType() {
   const mp4 = MP4_TYPES.find(ok);
   if (settings.format === 'mp4') return mp4 || webm || '';
   if (settings.format === 'webm') return webm || mp4 || '';
-  // 自動: WebM が使えるブラウザ(Chrome/Android等)は安定している WebM、
-  // 使えないブラウザ(iPhone Safari等)は MP4
-  return webm || mp4 || '';
+  // 自動: iPhone/iPad(写真アプリが WebM 非対応)は MP4、
+  // それ以外(Chrome/Android等)は安定している WebM
+  return isAppleMobile() ? mp4 || webm || '' : webm || mp4 || '';
 }
 
 async function runCountdown() {
