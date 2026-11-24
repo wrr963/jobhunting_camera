@@ -59,6 +59,7 @@ let resultUrl = null;
 let resultName = '';
 let wakeLock = null;
 let countingDown = false;
+let recordingDirect = false;
 
 // 合成用キャンバス
 const frameCv = document.createElement('canvas');
@@ -368,15 +369,14 @@ function onVideoFrame(_now, meta) {
     srcW = meta.width;
     srcH = meta.height;
   }
-  drawFrame();
   video.requestVideoFrameCallback(onVideoFrame);
 }
 
 function render(now) {
   requestAnimationFrame(render);
   tickPrompter(now);
-  // requestVideoFrameCallback 非対応 or 止まっている場合の保険
-  if (!hasRVFC || now - lastFrameDraw > 200) drawFrame();
+  // 毎フレーム一定間隔で描画(キャンバス録画の映像が途切れないように)
+  drawFrame();
 }
 
 // ---------- カンペ ----------
@@ -560,6 +560,10 @@ for (const k of checks) {
 $('bgMode').addEventListener('click', async (e) => {
   const v = e.target.dataset && e.target.dataset.v;
   if (!v) return;
+  if (recording || countingDown) {
+    toast('録画中は背景を変更できません');
+    return;
+  }
   settings.bgMode = v;
   saveSettings();
   syncSettingsUI();
@@ -682,9 +686,13 @@ async function startRecording() {
   countingDown = false;
   if (!document.body.classList.contains('recording')) return; // カウントダウン中に中止された
 
-  const canvasStream = stage.captureStream(30);
-  const tracks = [...canvasStream.getVideoTracks(), ...stream.getAudioTracks()];
-  const mixed = new MediaStream(tracks);
+  // 背景なし: カメラ映像をそのまま録画(最も安定)
+  // 背景あり: 合成したキャンバスを録画
+  const direct = settings.bgMode === 'none' || !segmenter;
+  const canvasStream = direct ? null : stage.captureStream(30);
+  const videoTracks = direct ? stream.getVideoTracks() : canvasStream.getVideoTracks();
+  const mixed = new MediaStream([...videoTracks, ...stream.getAudioTracks()]);
+  recordingDirect = direct;
   const mimeType = pickMimeType();
   const opts = {
     videoBitsPerSecond: settings.quality === '1080' ? 8_000_000 : 5_000_000,
@@ -702,7 +710,7 @@ async function startRecording() {
     if (e.data && e.data.size) chunks.push(e.data);
   };
   recorder.onstop = () => {
-    canvasStream.getVideoTracks().forEach((t) => t.stop());
+    if (canvasStream) canvasStream.getVideoTracks().forEach((t) => t.stop());
     const type = (recorder.mimeType || mimeType || 'video/webm').split(';')[0];
     showResult(new Blob(chunks, { type }));
   };
