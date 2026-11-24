@@ -131,7 +131,10 @@ function updateCanvasSize() {
   const land = isLandscape();
   const W = land ? long : short;
   const H = land ? short : long;
-  if (stage.width === W && stage.height === H) return;
+  if (stage.width === W && stage.height === H) {
+    layoutStage();
+    return;
+  }
   for (const c of [stage, frameCv, personCv]) {
     c.width = W;
     c.height = H;
@@ -143,6 +146,22 @@ function updateCanvasSize() {
   maskImage = maskCtx.createImageData(maskCv.width, maskCv.height);
   prevMask = null;
   updateBlurSize();
+  layoutStage();
+}
+// 画面に収まるよう縦横比を保って表示(引き伸ばし防止)
+function layoutStage() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const sc = Math.min(vw / stage.width, vh / stage.height);
+  const w = Math.round(stage.width * sc);
+  const h = Math.round(stage.height * sc);
+  // カメラ映像の<video>もキャンバスの真下に同じ位置で置く
+  for (const el of [stage, video]) {
+    el.style.width = `${w}px`;
+    el.style.height = `${h}px`;
+    el.style.left = `${Math.round((vw - w) / 2)}px`;
+    el.style.top = `${Math.round((vh - h) / 2)}px`;
+  }
 }
 function updateBlurSize() {
   blurCv1.width = Math.max(1, Math.round(stage.width / 4));
@@ -169,10 +188,16 @@ async function startCamera() {
     },
   };
   stream = await navigator.mediaDevices.getUserMedia(constraints);
+  srcW = srcH = 0;
   video.srcObject = stream;
   await video.play().catch(() => {});
+  if (hasRVFC && !rvfcStarted) {
+    rvfcStarted = true;
+    video.requestVideoFrameCallback(onVideoFrame);
+  }
   applyMirror();
 }
+let rvfcStarted = false;
 
 function applyMirror() {
   stage.classList.toggle('mirror', settings.mirror && facing === 'user');
@@ -277,25 +302,50 @@ function drawBackground(W, H) {
 }
 
 // ---------- 描画ループ ----------
-function render(now) {
-  requestAnimationFrame(render);
-  tickPrompter(now);
+// カメラの実フレームサイズ(回転直後に videoWidth が古いままになる端末対策)
+let srcW = 0;
+let srcH = 0;
+let lastFrameDraw = 0;
+let segCost = 0;
+let segSkip = 0;
+const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 
-  if (!video.videoWidth) return;
+function sourceSize() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (srcW && srcH) {
+    // メタデータと videoWidth の縦横が食い違う場合はメタデータを優先
+    return [srcW, srcH];
+  }
+  return [vw, vh];
+}
+
+function drawFrame() {
+  if (!video.videoWidth || video.readyState < 2) return;
+  lastFrameDraw = performance.now();
   const W = stage.width;
   const H = stage.height;
+  const [iw, ih] = sourceSize();
 
-  drawCover(frameCtx, video, video.videoWidth, video.videoHeight, W, H);
+  drawCover(frameCtx, video, iw, ih, W, H);
 
   if (settings.bgMode === 'none' || !segmenter || !maskImage) {
     ctx.drawImage(frameCv, 0, 0);
     return;
   }
 
-  try {
-    runSegmentation();
-  } catch (e) {
-    console.error(e);
+  // 端末が遅い場合はマスク計算を間引く(前回のマスクを再利用)
+  if (segSkip > 0) {
+    segSkip--;
+  } else {
+    const t0 = performance.now();
+    try {
+      runSegmentation();
+    } catch (e) {
+      console.error(e);
+    }
+    segCost = segCost * 0.8 + (performance.now() - t0) * 0.2;
+    segSkip = Math.min(3, Math.floor(segCost / 18));
   }
 
   // 人物だけを切り抜く
@@ -309,6 +359,23 @@ function render(now) {
 
   drawBackground(W, H);
   ctx.drawImage(personCv, 0, 0);
+}
+
+// 新しいカメラフレームが来るたびに描画
+function onVideoFrame(_now, meta) {
+  if (meta && meta.width && meta.height) {
+    srcW = meta.width;
+    srcH = meta.height;
+  }
+  drawFrame();
+  video.requestVideoFrameCallback(onVideoFrame);
+}
+
+function render(now) {
+  requestAnimationFrame(render);
+  tickPrompter(now);
+  // requestVideoFrameCallback 非対応 or 止まっている場合の保険
+  if (!hasRVFC || now - lastFrameDraw > 200) drawFrame();
 }
 
 // ---------- カンペ ----------
@@ -355,11 +422,19 @@ function updateSpeedLabel() {
   $('speedLabel').textContent = `速さ ${settings.speed}`;
 }
 
+// カンペの先頭/末尾がガイド線の位置に来るよう余白を表示エリアの高さから計算
+function layoutPrompter() {
+  const h = pScroll.clientHeight;
+  pText.style.paddingTop = `${Math.round(h * 0.3)}px`;
+  pText.style.paddingBottom = `${Math.round(h * 0.7)}px`;
+}
+
 function applyPrompterStyle() {
   const r = document.documentElement.style;
   r.setProperty('--p-font', `${settings.fontSize}px`);
   r.setProperty('--p-bg', String(settings.opacity / 100));
   r.setProperty('--p-height', `${settings.pHeight}%`);
+  layoutPrompter();
 }
 
 // 手で触ったら一時的に自動スクロールを止める
@@ -614,7 +689,7 @@ async function startRecording() {
     const type = (recorder.mimeType || mimeType || 'video/webm').split(';')[0];
     showResult(new Blob(chunks, { type }));
   };
-  recorder.start(1000);
+  recorder.start();
   recording = true;
   recStart = performance.now();
   $('recBadge').classList.remove('hidden');
@@ -707,9 +782,31 @@ window.addEventListener('beforeunload', (e) => {
 
 // ---------- 画面の向き ----------
 let resizeTimer = null;
+let lastLand = isLandscape();
+const isTouchDevice = window.matchMedia('(pointer: coarse)').matches;
 function onResize() {
+  layoutStage();
+  layoutPrompter();
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(updateCanvasSize, 150);
+  resizeTimer = setTimeout(async () => {
+    updateCanvasSize();
+    layoutStage();
+    const land = isLandscape();
+    if (land === lastLand) return;
+    lastLand = land;
+    // スマホを回転したとき、カメラ映像の縦横が画面と合っていなければ
+    // カメラを取り直して正しいサイズのフレームを得る(録画中は行わない)
+    if (!isTouchDevice || !stream || recording || countingDown) return;
+    await new Promise((r) => setTimeout(r, 400));
+    const [w, h] = sourceSize();
+    if (w && h && (w > h) !== land && !recording && !countingDown) {
+      try {
+        await startCamera();
+      } catch (e) {
+        console.warn(e);
+      }
+    }
+  }, 150);
 }
 window.addEventListener('resize', onResize);
 window.addEventListener('orientationchange', onResize);
