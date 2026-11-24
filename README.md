@@ -27,10 +27,12 @@
 - `index.html` 画面
 - `style.css` デザイン
 - `app.js` カメラ・合成・録画・カンペ制御
+- `webcodecs-recorder.js` / `audio-worklet.js` 安定モードの録画(WebCodecsでH.264/AACにエンコードしてMP4を作成)
+- `vendor/mp4-muxer.mjs` MP4作成ライブラリ(MIT License)
 - 背景処理には MediaPipe(Selfie Segmentation)を CDN から読み込みます(背景をオンにしたときのみ)
 
 ## 注意
 
-- 背景「なし」のときはカメラ映像をそのまま録画します(最も安定)。背景ありのときは合成した映像を録画します。
+- 録画は「安定モード」(WebCodecsで端末内エンコード→MP4)で行います。iPhoneはiOS 26以降で対応。非対応の端末ではMediaRecorderによる「互換モード」になります(録画完了画面に表示されます)。
 - 録画ファイルの形式はブラウザによって MP4 または WebM になります(iPhone Safari / 最近のChromeはMP4)。
 - 背景処理は端末の性能によってはカクつくことがあります。その場合は画質を720pにしてください。

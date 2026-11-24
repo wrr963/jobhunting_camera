@@ -170,12 +170,12 @@
         <div class="row">
           <label>保存形式</label>
           <div class="seg" id="format">
-            <button data-v="auto">自動</button>
+            <button data-v="auto">自動(推奨)</button>
             <button data-v="mp4">MP4</button>
             <button data-v="webm">WebM</button>
           </div>
         </div>
-        <p class="muted small-text">※ 録画が途中で止まる場合は「自動」か「WebM」を選んでください。iPhone は MP4 のみ対応です。</p>
+        <p class="muted small-text">※「自動」は端末内でエンコードして MP4 を作る安定した方式です(iPhoneはiOS 26以降)。非対応の端末では従来方式で録画します。MP4/WebM を選ぶと従来方式(MediaRecorder)になります。</p>
         <p class="muted small-text">※ 縦持ちで録画すると縦長、横持ちで録画すると横長の動画になります。録画済みの動画は左右反転されません。</p>
       </div>
     </div>

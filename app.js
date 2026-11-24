@@ -1,5 +1,6 @@
 // カンペカメラ - カンペを読みながら録画できるWebアプリ
 'use strict';
+import { WebCodecsRecorder, probeConfigs, webCodecsAvailable } from './webcodecs-recorder.js';
 
 // ---------- 定数 ----------
 const MP_VERSION = '0.10.14';
@@ -60,7 +61,11 @@ let resultUrl = null;
 let resultName = '';
 let wakeLock = null;
 let countingDown = false;
-let recordingDirect = false;
+let recordMode = '';
+let wcRecorder = null;
+let audioCtx = null;
+let audioNode = null;
+let audioSource = null;
 let recordingCanvas = false;
 
 // 合成用キャンバス
@@ -201,8 +206,58 @@ async function startCamera() {
     video.requestVideoFrameCallback(onVideoFrame);
   }
   applyMirror();
+  setupAudioGraph();
 }
 let rvfcStarted = false;
+
+// タップ操作の中で同期的に作る(iOSでは操作なしに音声処理を開始できない)
+function ensureAudioCtx() {
+  if (audioCtx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  try {
+    audioCtx = new AC({ sampleRate: 48000 });
+  } catch {
+    try {
+      audioCtx = new AC();
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+}
+
+// マイク音声を AudioWorklet で取り出す(WebCodecs 録画用)
+async function setupAudioGraph() {
+  try {
+    ensureAudioCtx();
+    if (!audioCtx || !window.AudioWorkletNode) return;
+    if (!audioNode) {
+      await audioCtx.audioWorklet.addModule('audio-worklet.js');
+      audioNode = new AudioWorkletNode(audioCtx, 'capture-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: 1,
+        channelCountMode: 'explicit',
+      });
+      // 録画中だけ音声をエンコーダへ渡す(録画前の音声は捨てる)
+      audioNode.port.onmessage = (e) => {
+        if (wcRecorder && wcRecorder.active) wcRecorder.onAudio(e);
+      };
+      const mute = audioCtx.createGain();
+      mute.gain.value = 0;
+      audioNode.connect(mute).connect(audioCtx.destination);
+    }
+    if (audioSource) audioSource.disconnect();
+    const at = stream && stream.getAudioTracks()[0];
+    if (!at) return;
+    audioSource = audioCtx.createMediaStreamSource(new MediaStream([at]));
+    audioSource.connect(audioNode);
+    if (audioCtx.state !== 'running') await audioCtx.resume().catch(() => {});
+  } catch (e) {
+    console.warn('audio graph setup failed', e);
+    audioNode = null;
+  }
+}
 
 function applyMirror() {
   const m = settings.mirror && facing === 'user';
@@ -391,6 +446,7 @@ function render(now) {
   tickPrompter(now);
   // 毎フレーム一定間隔で描画(キャンバス録画の映像が途切れないように)
   drawFrame();
+  if (wcRecorder) wcRecorder.captureFrame();
 }
 
 // ---------- カンペ ----------
@@ -696,32 +752,88 @@ async function runCountdown() {
   el.classList.add('hidden');
 }
 
+function videoBitrate() {
+  return settings.quality === '1080' ? 5_000_000 : 2_500_000;
+}
+
 async function startRecording() {
   if (!stream) return;
-  if (!stage.captureStream || !window.MediaRecorder) {
-    toast('このブラウザは録画に対応していません', 3500);
-    return;
-  }
+  // ユーザー操作の直後に音声処理を再開しておく(iOS対策)
+  if (audioCtx && audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
   updateCanvasSize();
   countingDown = true;
   document.body.classList.add('recording');
   $('btnRecord').classList.add('recording');
   if (settings.resetOnRec) resetPrompter();
+
+  // 録画方式を決める: 使えるなら WebCodecs(安定)、無理なら MediaRecorder
+  let configs = null;
+  if (settings.format === 'auto' && audioNode && webCodecsAvailable()) {
+    try {
+      configs = await probeConfigs(stage.width, stage.height, audioCtx.sampleRate, videoBitrate());
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+  if (!configs && (!stage.captureStream || !window.MediaRecorder)) {
+    toast('このブラウザは録画に対応していません', 3500);
+    stopRecording();
+    return;
+  }
+
   if (settings.countdownOn) await runCountdown();
   countingDown = false;
   if (!document.body.classList.contains('recording')) return; // カウントダウン中に中止された
 
-  // 背景なし: カメラ映像をそのまま録画(最も安定)
-  // 背景あり: 合成したキャンバスを録画
+  if (configs) {
+    recordingCanvas = true; // 毎フレーム キャンバスに描いてエンコード
+    drawFrame();
+    wcRecorder = new WebCodecsRecorder({
+      canvas: stage,
+      audioCtx,
+      audioNode,
+      configs,
+      onError: () => {
+        toast('録画中にエラーが発生したため停止しました', 3500);
+        if (recording) stopRecording();
+      },
+    });
+    try {
+      wcRecorder.start();
+    } catch (e) {
+      console.error(e);
+      wcRecorder = null;
+      recordingCanvas = false;
+      toast('録画を開始できませんでした', 3000);
+      stopRecording();
+      return;
+    }
+    recordMode = 'webcodecs';
+  } else {
+    startMediaRecorder();
+    recordMode = 'mediarecorder';
+  }
+
+  recording = true;
+  recStart = performance.now();
+  $('recBadge').classList.remove('hidden');
+  $('recTime').textContent = '00:00';
+  recTimer = setInterval(() => {
+    $('recTime').textContent = fmtTime((performance.now() - recStart) / 1000);
+  }, 250);
+  if (settings.autoScroll) setPlaying(true);
+}
+
+function startMediaRecorder() {
+  // 背景なし: カメラ映像をそのまま録画 / 背景あり: 合成したキャンバスを録画
   const direct = !usesCanvas();
   recordingCanvas = !direct;
   const canvasStream = direct ? null : stage.captureStream(30);
   const videoTracks = direct ? stream.getVideoTracks() : canvasStream.getVideoTracks();
   const mixed = new MediaStream([...videoTracks, ...stream.getAudioTracks()]);
-  recordingDirect = direct;
   const mimeType = pickMimeType();
   const opts = {
-    videoBitsPerSecond: settings.quality === '1080' ? 6_000_000 : 3_500_000,
+    videoBitsPerSecond: videoBitrate(),
     audioBitsPerSecond: 128_000,
   };
   if (mimeType) opts.mimeType = mimeType;
@@ -747,14 +859,6 @@ async function startRecording() {
     }
   };
   recorder.start();
-  recording = true;
-  recStart = performance.now();
-  $('recBadge').classList.remove('hidden');
-  $('recTime').textContent = '00:00';
-  recTimer = setInterval(() => {
-    $('recTime').textContent = fmtTime((performance.now() - recStart) / 1000);
-  }, 250);
-  if (settings.autoScroll) setPlaying(true);
 }
 
 function stopRecording() {
@@ -765,9 +869,25 @@ function stopRecording() {
   clearInterval(recTimer);
   $('recBadge').classList.add('hidden');
   setPlaying(false);
-  if (recorder && recorder.state !== 'inactive') recorder.stop();
+  if (wcRecorder) {
+    const r = wcRecorder;
+    wcRecorder = null;
+    toast('動画を保存しています…', 10000);
+    r.stop()
+      .then((blob) => {
+        $('toast').classList.add('hidden');
+        showResult(blob);
+      })
+      .catch((e) => {
+        console.error(e);
+        toast('動画の作成に失敗しました', 3500);
+      })
+      .finally(() => { recordingCanvas = false; });
+  } else {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    recordingCanvas = false;
+  }
   recording = false;
-  recordingCanvas = false;
 }
 
 $('btnRecord').onclick = () => {
@@ -851,7 +971,7 @@ function showResult(blob) {
   resultName = `kanpe-${fileStamp()}.${ext}`;
   const v = $('resultVideo');
   v.src = resultUrl;
-  $('resultInfo').textContent = `${(blob.size / 1024 / 1024).toFixed(1)} MB / ${ext.toUpperCase()}`;
+  $('resultInfo').textContent = `${(blob.size / 1024 / 1024).toFixed(1)} MB / ${ext.toUpperCase()} / ${recordMode === 'webcodecs' ? '安定モード' : '互換モード'}`;
   $('result').classList.remove('hidden');
   updateCanvasSize();
 }
@@ -939,6 +1059,7 @@ window.addEventListener('orientationchange', onResize);
 // ---------- 起動 ----------
 $('btnStart').onclick = async () => {
   $('startError').textContent = '';
+  ensureAudioCtx();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     $('startError').textContent =
       'このブラウザではカメラを使えません。HTTPSで開いているか、Safari / Chrome の最新版か確認してください。';
