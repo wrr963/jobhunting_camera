@@ -22,6 +22,7 @@ const DEFAULTS = {
   countdownOn: true,
   mirror: true,
   quality: '720',
+  landSide: 'left',   // 横画面でのカンペ位置: left | right
 };
 
 const SAMPLE_SCRIPT = `はじめまして。〇〇大学〇〇学部の〇〇です。
@@ -531,6 +532,7 @@ function syncSettingsUI() {
   }
   for (const k of checks) $(k).checked = !!settings[k];
   for (const b of $('bgMode').children) b.classList.toggle('active', b.dataset.v === settings.bgMode);
+  for (const b of $('landSide').children) b.classList.toggle('active', b.dataset.v === settings.landSide);
   for (const b of $('quality').children) b.classList.toggle('active', b.dataset.v === settings.quality);
   $('bgColor').value = settings.bgColor;
   $('bgColorRow').classList.toggle('hidden', !(settings.bgMode === 'color' || settings.bgMode === 'image'));
@@ -569,6 +571,21 @@ $('bgMode').addEventListener('click', async (e) => {
     }
   }
 });
+function applyLandSide() {
+  document.body.classList.toggle('p-right', settings.landSide === 'right');
+  layoutPrompter();
+}
+function setLandSide(v) {
+  settings.landSide = v;
+  saveSettings();
+  syncSettingsUI();
+  applyLandSide();
+}
+$('landSide').addEventListener('click', (e) => {
+  const v = e.target.dataset && e.target.dataset.v;
+  if (v) setLandSide(v);
+});
+$('btnSide').onclick = () => setLandSide(settings.landSide === 'right' ? 'left' : 'right');
 $('quality').addEventListener('click', (e) => {
   const v = e.target.dataset && e.target.dataset.v;
   if (!v || recording) return;
@@ -841,6 +858,7 @@ $('btnStart').onclick = async () => {
 };
 
 applyPrompterStyle();
+applyLandSide();
 renderScript();
 updateSpeedLabel();
 syncSettingsUI();

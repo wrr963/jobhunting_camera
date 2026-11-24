@@ -161,7 +161,9 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .record.recording span { width: 30px; height: 30px; border-radius: 6px; }
 body.recording .ctrl { opacity: 0.25; pointer-events: none; }
 
-/* 横向き: 操作ボタンを右側に縦並び、カンペは左側 */
+#btnSide { display: none; }
+
+/* 横向き: 操作ボタンを右側に縦並び、カンペは左半分 or 右半分(縦いっぱい) */
 @media (orientation: landscape) {
   .controls {
     top: 0; bottom: 0;
@@ -171,10 +173,23 @@ body.recording .ctrl { opacity: 0.25; pointer-events: none; }
     width: 90px;
   }
   .prompter {
-    right: calc(var(--safe-r) + 112px);
+    /* 操作ボタン列を除いた領域を2等分した幅 */
+    --pw: calc((100% - var(--safe-l) - var(--safe-r) - 112px - 12px - 12px) / 2);
+    top: calc(var(--safe-t) + 8px);
+    bottom: calc(var(--safe-b) + 8px);
+    height: auto;
+    width: var(--pw);
     left: calc(var(--safe-l) + 12px);
+    right: auto;
   }
-  .prompter-text { padding-left: 24px; padding-right: 24px; }
+  body.p-right .prompter {
+    left: calc(var(--safe-l) + 12px + var(--pw) + 12px);
+  }
+  .prompter-text { padding-left: 20px; padding-right: 20px; }
+  .prompter-bar { gap: 4px; padding: 0 4px; }
+  .prompter-bar .chip { min-width: 32px; padding: 0 8px; }
+  .prompter-bar .chip-label { display: none; }
+  #btnSide { display: inline-block; }
 }
 
 .rec-badge {
@@ -190,7 +205,9 @@ body.recording .ctrl { opacity: 0.25; pointer-events: none; }
   z-index: 6;
 }
 @media (orientation: landscape) {
-  .rec-badge { bottom: calc(var(--safe-b) + 14px); }
+  /* カンペと反対側の半分の上部に表示 */
+  .rec-badge { bottom: auto; top: calc(var(--safe-t) + 14px); left: 75%; }
+  body.p-right .rec-badge { left: 25%; }
 }
 .rec-badge .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: 0.2; } }

@@ -32,7 +32,8 @@
         <button id="btnSlower" class="chip" title="遅く">−</button>
         <span id="speedLabel" class="speed-label">速さ 30</span>
         <button id="btnFaster" class="chip" title="速く">＋</button>
-        <button id="btnEdit" class="chip" title="カンペ編集">✎ 編集</button>
+        <button id="btnSide" class="chip" title="カンペを左右に移動">⇄</button>
+        <button id="btnEdit" class="chip" title="カンペ編集">✎<span class="chip-label"> 編集</span></button>
       </div>
     </div>
 
@@ -130,9 +131,16 @@
           <output id="opacityOut"></output>
         </div>
         <div class="row">
-          <label for="pHeight">表示エリアの高さ</label>
+          <label for="pHeight">表示エリアの高さ(縦画面)</label>
           <input type="range" id="pHeight" min="20" max="80" step="5" />
           <output id="pHeightOut"></output>
+        </div>
+        <div class="row">
+          <label>横画面での位置</label>
+          <div class="seg" id="landSide">
+            <button data-v="left">左半分</button>
+            <button data-v="right">右半分</button>
+          </div>
         </div>
         <div class="row">
           <label for="autoScroll">録画開始で自動スクロール</label>
