@@ -1,0 +1,751 @@
+// カンペカメラ - カンペを読みながら録画できるWebアプリ
+'use strict';
+
+// ---------- 定数 ----------
+const MP_VERSION = '0.10.14';
+const MP_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+const SEG_MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite';
+const LS_SETTINGS = 'kanpe.settings.v1';
+const LS_SCRIPT = 'kanpe.script.v1';
+
+const DEFAULTS = {
+  bgMode: 'none',      // none | blur | color | image
+  bgColor: '#ffffff',
+  blurAmount: 6,
+  speed: 20,
+  fontSize: 28,
+  opacity: 45,
+  pHeight: 40,
+  autoScroll: true,
+  resetOnRec: true,
+  countdownOn: true,
+  mirror: true,
+  quality: '720',
+};
+
+const SAMPLE_SCRIPT = `はじめまして。〇〇大学〇〇学部の〇〇です。
+
+本日は「学生時代に力を入れたこと」についてお話しします。
+
+（ここに原稿を入力してください。「✎ 編集」から、貼り付けや編集ができます。）
+
+ご清聴ありがとうございました。`;
+
+// ---------- 要素 ----------
+const $ = (id) => document.getElementById(id);
+const stage = $('stage');
+const ctx = stage.getContext('2d');
+const video = $('cam');
+const prompter = $('prompter');
+const pScroll = $('prompterScroll');
+const pText = $('prompterText');
+
+// ---------- 状態 ----------
+const settings = loadSettings();
+let script = localStorage.getItem(LS_SCRIPT);
+if (script === null) script = SAMPLE_SCRIPT;
+
+let stream = null;
+let facing = 'user';
+let recorder = null;
+let chunks = [];
+let recording = false;
+let recStart = 0;
+let recTimer = null;
+let resultBlob = null;
+let resultUrl = null;
+let resultName = '';
+let wakeLock = null;
+let countingDown = false;
+
+// 合成用キャンバス
+const frameCv = document.createElement('canvas');
+const frameCtx = frameCv.getContext('2d');
+const personCv = document.createElement('canvas');
+const personCtx = personCv.getContext('2d');
+const blurCv1 = document.createElement('canvas');
+const blurCtx1 = blurCv1.getContext('2d');
+const blurCv2 = document.createElement('canvas');
+const blurCtx2 = blurCv2.getContext('2d');
+const segCv = document.createElement('canvas');
+const segCtx = segCv.getContext('2d', { willReadFrequently: true });
+const maskCv = document.createElement('canvas');
+const maskCtx = maskCv.getContext('2d');
+let maskImage = null;
+let prevMask = null;
+
+// セグメンテーション
+let segmenter = null;
+let segLoading = null;
+let segFailed = false;
+let lastSegTs = 0;
+let bgImage = null;
+
+// カンペ
+let pPlaying = false;
+let pPos = 0;
+let touching = false;
+let userHoldUntil = 0;
+let lastTick = performance.now();
+
+// ---------- 設定 ----------
+function loadSettings() {
+  try {
+    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}') };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+function saveSettings() {
+  localStorage.setItem(LS_SETTINGS, JSON.stringify(settings));
+}
+
+// ---------- ユーティリティ ----------
+let toastTimer = null;
+function toast(msg, ms = 2200) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), ms);
+}
+const pad = (n) => String(n).padStart(2, '0');
+function fmtTime(sec) {
+  return `${pad(Math.floor(sec / 60))}:${pad(Math.floor(sec % 60))}`;
+}
+function fileStamp() {
+  const d = new Date();
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+// ---------- キャンバスサイズ(縦横) ----------
+function isLandscape() {
+  return window.innerWidth > window.innerHeight;
+}
+function updateCanvasSize() {
+  if (recording || countingDown) return; // 録画中はサイズ固定
+  const hd = settings.quality === '1080';
+  const long = hd ? 1920 : 1280;
+  const short = hd ? 1080 : 720;
+  const land = isLandscape();
+  const W = land ? long : short;
+  const H = land ? short : long;
+  if (stage.width === W && stage.height === H) return;
+  for (const c of [stage, frameCv, personCv]) {
+    c.width = W;
+    c.height = H;
+  }
+  // セグメンテーション入力は長辺256px程度
+  const sc = 256 / Math.max(W, H);
+  segCv.width = maskCv.width = Math.round(W * sc);
+  segCv.height = maskCv.height = Math.round(H * sc);
+  maskImage = maskCtx.createImageData(maskCv.width, maskCv.height);
+  prevMask = null;
+  updateBlurSize();
+}
+function updateBlurSize() {
+  blurCv1.width = Math.max(1, Math.round(stage.width / 4));
+  blurCv1.height = Math.max(1, Math.round(stage.height / 4));
+  const k = 4 + settings.blurAmount * 3; // 7..34
+  blurCv2.width = Math.max(1, Math.round(stage.width / k));
+  blurCv2.height = Math.max(1, Math.round(stage.height / k));
+}
+
+// ---------- カメラ ----------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  const constraints = {
+    video: {
+      facingMode: facing,
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      frameRate: { ideal: 30 },
+    },
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  };
+  stream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  applyMirror();
+}
+
+function applyMirror() {
+  stage.classList.toggle('mirror', settings.mirror && facing === 'user');
+}
+
+// ---------- 背景処理 (MediaPipe) ----------
+async function ensureSegmenter() {
+  if (segmenter || segFailed) return segmenter;
+  if (segLoading) return segLoading;
+  $('bgStatus').textContent = '背景処理を読み込み中…';
+  segLoading = (async () => {
+    try {
+      const vision = await import(`${MP_BASE}/vision_bundle.mjs`);
+      const fileset = await vision.FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
+      const make = (delegate) =>
+        vision.ImageSegmenter.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: SEG_MODEL_URL, delegate },
+          runningMode: 'VIDEO',
+          outputCategoryMask: false,
+          outputConfidenceMasks: true,
+        });
+      try {
+        segmenter = await make('GPU');
+      } catch (e) {
+        console.warn('GPU delegate failed, fallback to CPU', e);
+        segmenter = await make('CPU');
+      }
+      $('bgStatus').textContent = '';
+      return segmenter;
+    } catch (e) {
+      console.error(e);
+      segFailed = true;
+      $('bgStatus').textContent = '背景処理を読み込めませんでした(通信環境を確認してください)。';
+      return null;
+    } finally {
+      segLoading = null;
+    }
+  })();
+  return segLoading;
+}
+
+function runSegmentation() {
+  segCtx.drawImage(frameCv, 0, 0, segCv.width, segCv.height);
+  let ts = performance.now();
+  if (ts <= lastSegTs) ts = lastSegTs + 1;
+  lastSegTs = ts;
+  let ok = false;
+  segmenter.segmentForVideo(segCv, ts, (result) => {
+    const m = result.confidenceMasks && result.confidenceMasks[0];
+    if (!m) return;
+    const conf = m.getAsFloat32Array();
+    const n = maskCv.width * maskCv.height;
+    if (conf.length !== n) return;
+    if (!prevMask || prevMask.length !== n) prevMask = new Float32Array(conf);
+    const px = maskImage.data;
+    for (let i = 0; i < n; i++) {
+      // 時間方向に少しなめらかにしてチラつきを抑える
+      const c = prevMask[i] * 0.35 + conf[i] * 0.65;
+      prevMask[i] = c;
+      // 0.25〜0.75 をなめらかに 0〜1 へ
+      let a = (c - 0.25) / 0.5;
+      a = a < 0 ? 0 : a > 1 ? 1 : a;
+      a = a * a * (3 - 2 * a);
+      const j = i * 4;
+      px[j] = px[j + 1] = px[j + 2] = 255;
+      px[j + 3] = a * 255;
+    }
+    ok = true;
+  });
+  if (ok) maskCtx.putImageData(maskImage, 0, 0);
+  return ok;
+}
+
+function drawCover(c, img, iw, ih, W, H) {
+  const s = Math.max(W / iw, H / ih);
+  const dw = iw * s;
+  const dh = ih * s;
+  c.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+}
+
+function drawBackground(W, H) {
+  switch (settings.bgMode) {
+    case 'blur':
+      blurCtx1.drawImage(frameCv, 0, 0, blurCv1.width, blurCv1.height);
+      blurCtx2.drawImage(blurCv1, 0, 0, blurCv2.width, blurCv2.height);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(blurCv2, 0, 0, W, H);
+      break;
+    case 'image':
+      if (bgImage) {
+        drawCover(ctx, bgImage, bgImage.naturalWidth, bgImage.naturalHeight, W, H);
+        break;
+      }
+    // 画像未選択なら単色にフォールバック
+    // falls through
+    case 'color':
+    default:
+      ctx.fillStyle = settings.bgColor;
+      ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// ---------- 描画ループ ----------
+function render(now) {
+  requestAnimationFrame(render);
+  tickPrompter(now);
+
+  if (!video.videoWidth) return;
+  const W = stage.width;
+  const H = stage.height;
+
+  drawCover(frameCtx, video, video.videoWidth, video.videoHeight, W, H);
+
+  if (settings.bgMode === 'none' || !segmenter || !maskImage) {
+    ctx.drawImage(frameCv, 0, 0);
+    return;
+  }
+
+  try {
+    runSegmentation();
+  } catch (e) {
+    console.error(e);
+  }
+
+  // 人物だけを切り抜く
+  personCtx.globalCompositeOperation = 'copy';
+  personCtx.imageSmoothingEnabled = true;
+  personCtx.imageSmoothingQuality = 'high';
+  personCtx.drawImage(maskCv, 0, 0, W, H);
+  personCtx.globalCompositeOperation = 'source-in';
+  personCtx.drawImage(frameCv, 0, 0);
+  personCtx.globalCompositeOperation = 'source-over';
+
+  drawBackground(W, H);
+  ctx.drawImage(personCv, 0, 0);
+}
+
+// ---------- カンペ ----------
+function renderScript() {
+  const empty = !script.trim();
+  pText.textContent = empty ? '「✎ 編集」から原稿を入力・貼り付けしてください。' : script;
+  pText.classList.toggle('empty', empty);
+}
+
+function speedPxPerSec() {
+  // 速さは文字サイズに比例(文字を大きくしても読むペースが変わらない)
+  return (settings.speed * settings.fontSize * 1.6) / 40;
+}
+
+function setPlaying(on) {
+  pPlaying = on;
+  $('btnPlay').textContent = on ? '⏸' : '▶';
+  if (on) pPos = pScroll.scrollTop;
+}
+
+function resetPrompter() {
+  pPos = 0;
+  pScroll.scrollTop = 0;
+}
+
+function tickPrompter(now) {
+  const dt = Math.min(0.1, (now - lastTick) / 1000);
+  lastTick = now;
+  if (!pPlaying) return;
+  if (touching || now < userHoldUntil) {
+    pPos = pScroll.scrollTop;
+    return;
+  }
+  const max = pScroll.scrollHeight - pScroll.clientHeight;
+  pPos += speedPxPerSec() * dt;
+  if (pPos >= max) {
+    pPos = max;
+    setPlaying(false);
+  }
+  pScroll.scrollTop = pPos;
+}
+
+function updateSpeedLabel() {
+  $('speedLabel').textContent = `速さ ${settings.speed}`;
+}
+
+function applyPrompterStyle() {
+  const r = document.documentElement.style;
+  r.setProperty('--p-font', `${settings.fontSize}px`);
+  r.setProperty('--p-bg', String(settings.opacity / 100));
+  r.setProperty('--p-height', `${settings.pHeight}%`);
+}
+
+// 手で触ったら一時的に自動スクロールを止める
+pScroll.addEventListener('touchstart', () => { touching = true; }, { passive: true });
+pScroll.addEventListener('touchend', () => {
+  touching = false;
+  userHoldUntil = performance.now() + 700;
+}, { passive: true });
+pScroll.addEventListener('touchcancel', () => { touching = false; }, { passive: true });
+pScroll.addEventListener('wheel', () => { userHoldUntil = performance.now() + 700; }, { passive: true });
+pScroll.addEventListener('scroll', () => {
+  if (!pPlaying) pPos = pScroll.scrollTop;
+});
+
+$('btnPlay').onclick = () => setPlaying(!pPlaying);
+$('btnTop').onclick = () => resetPrompter();
+$('btnSlower').onclick = () => changeSpeed(-2);
+$('btnFaster').onclick = () => changeSpeed(+2);
+function changeSpeed(d) {
+  settings.speed = Math.max(0, Math.min(100, settings.speed + d));
+  saveSettings();
+  updateSpeedLabel();
+  syncSettingsUI();
+}
+
+// ---------- カンペ編集 ----------
+const scriptInput = $('scriptInput');
+function updateCharCount() {
+  $('charCount').textContent = `${scriptInput.value.replace(/\s/g, '').length} 文字`;
+}
+$('btnEdit').onclick = () => {
+  setPlaying(false);
+  scriptInput.value = script;
+  updateCharCount();
+  $('editor').classList.remove('hidden');
+};
+$('btnEditDone').onclick = () => {
+  $('editor').classList.add('hidden');
+  scriptInput.blur();
+};
+scriptInput.addEventListener('input', () => {
+  script = scriptInput.value;
+  localStorage.setItem(LS_SCRIPT, script);
+  renderScript();
+  updateCharCount();
+});
+$('btnPaste').onclick = async () => {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (!text) return toast('クリップボードが空です');
+    const s = scriptInput.selectionStart ?? scriptInput.value.length;
+    const e = scriptInput.selectionEnd ?? s;
+    scriptInput.setRangeText(text, s, e, 'end');
+    scriptInput.dispatchEvent(new Event('input'));
+    toast('貼り付けました');
+  } catch {
+    scriptInput.focus();
+    toast('入力欄を長押しして「ペースト」を選んでください', 3000);
+  }
+};
+$('btnCopy').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(scriptInput.value);
+    toast('コピーしました');
+  } catch {
+    scriptInput.focus();
+    scriptInput.select();
+    const ok = document.execCommand && document.execCommand('copy');
+    toast(ok ? 'コピーしました' : '全選択しました。長押しでコピーしてください', 2500);
+  }
+};
+$('btnClear').onclick = () => {
+  if (!scriptInput.value || confirm('原稿をすべて消去しますか？')) {
+    scriptInput.value = '';
+    scriptInput.dispatchEvent(new Event('input'));
+    scriptInput.focus();
+  }
+};
+
+// ---------- 設定画面 ----------
+const ranges = {
+  speed: (v) => v,
+  fontSize: (v) => `${v}`,
+  opacity: (v) => `${v}%`,
+  pHeight: (v) => `${v}%`,
+  blurAmount: (v) => v,
+};
+const checks = ['autoScroll', 'resetOnRec', 'countdownOn', 'mirror'];
+
+function syncSettingsUI() {
+  for (const [k, fmt] of Object.entries(ranges)) {
+    $(k).value = settings[k];
+    $(`${k}Out`).textContent = fmt(settings[k]);
+  }
+  for (const k of checks) $(k).checked = !!settings[k];
+  for (const b of $('bgMode').children) b.classList.toggle('active', b.dataset.v === settings.bgMode);
+  for (const b of $('quality').children) b.classList.toggle('active', b.dataset.v === settings.quality);
+  $('bgColor').value = settings.bgColor;
+  $('bgColorRow').classList.toggle('hidden', !(settings.bgMode === 'color' || settings.bgMode === 'image'));
+  $('bgBlurRow').classList.toggle('hidden', settings.bgMode !== 'blur');
+  $('bgImageRow').classList.toggle('hidden', settings.bgMode !== 'image');
+}
+
+for (const k of Object.keys(ranges)) {
+  $(k).addEventListener('input', (e) => {
+    settings[k] = Number(e.target.value);
+    $(`${k}Out`).textContent = ranges[k](settings[k]);
+    saveSettings();
+    applyPrompterStyle();
+    updateSpeedLabel();
+    if (k === 'blurAmount') updateBlurSize();
+  });
+}
+for (const k of checks) {
+  $(k).addEventListener('change', (e) => {
+    settings[k] = e.target.checked;
+    saveSettings();
+    if (k === 'mirror') applyMirror();
+  });
+}
+$('bgMode').addEventListener('click', async (e) => {
+  const v = e.target.dataset && e.target.dataset.v;
+  if (!v) return;
+  settings.bgMode = v;
+  saveSettings();
+  syncSettingsUI();
+  if (v !== 'none') {
+    const s = await ensureSegmenter();
+    if (!s) {
+      settings.bgMode = 'none';
+      syncSettingsUI();
+    }
+  }
+});
+$('quality').addEventListener('click', (e) => {
+  const v = e.target.dataset && e.target.dataset.v;
+  if (!v || recording) return;
+  settings.quality = v;
+  saveSettings();
+  syncSettingsUI();
+  updateCanvasSize();
+});
+$('swatches').addEventListener('click', (e) => {
+  const c = e.target.dataset && e.target.dataset.c;
+  if (!c) return;
+  settings.bgColor = c;
+  if (settings.bgMode === 'image' && !bgImage) settings.bgMode = 'color';
+  saveSettings();
+  syncSettingsUI();
+});
+$('bgColor').addEventListener('input', (e) => {
+  settings.bgColor = e.target.value;
+  saveSettings();
+});
+$('bgImage').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    bgImage = img;
+    toast('背景画像を設定しました');
+  };
+  img.onerror = () => toast('画像を読み込めませんでした');
+  img.src = URL.createObjectURL(f);
+});
+
+$('btnSettings').onclick = () => {
+  syncSettingsUI();
+  $('settings').classList.remove('hidden');
+};
+$('btnSettingsDone').onclick = () => $('settings').classList.add('hidden');
+for (const id of ['settings', 'editor']) {
+  $(id).addEventListener('click', (e) => {
+    if (e.target.id === id) $(id).classList.add('hidden');
+  });
+}
+
+// ---------- カメラ切替 ----------
+$('btnFlip').onclick = async () => {
+  if (recording) return;
+  facing = facing === 'user' ? 'environment' : 'user';
+  try {
+    await startCamera();
+  } catch (e) {
+    console.error(e);
+    facing = facing === 'user' ? 'environment' : 'user';
+    toast('カメラを切り替えられませんでした');
+    await startCamera().catch(() => {});
+  }
+};
+
+// ---------- 録画 ----------
+function pickMimeType() {
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
+  const list = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4;codecs=avc1,mp4a',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  return list.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+}
+
+async function runCountdown() {
+  const el = $('countdown');
+  el.classList.remove('hidden');
+  for (let i = 3; i > 0; i--) {
+    el.textContent = i;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  el.classList.add('hidden');
+}
+
+async function startRecording() {
+  if (!stream) return;
+  if (!stage.captureStream || !window.MediaRecorder) {
+    toast('このブラウザは録画に対応していません', 3500);
+    return;
+  }
+  updateCanvasSize();
+  countingDown = true;
+  document.body.classList.add('recording');
+  $('btnRecord').classList.add('recording');
+  if (settings.resetOnRec) resetPrompter();
+  if (settings.countdownOn) await runCountdown();
+  countingDown = false;
+  if (!document.body.classList.contains('recording')) return; // カウントダウン中に中止された
+
+  const canvasStream = stage.captureStream(30);
+  const tracks = [...canvasStream.getVideoTracks(), ...stream.getAudioTracks()];
+  const mixed = new MediaStream(tracks);
+  const mimeType = pickMimeType();
+  const opts = {
+    videoBitsPerSecond: settings.quality === '1080' ? 8_000_000 : 5_000_000,
+    audioBitsPerSecond: 128_000,
+  };
+  if (mimeType) opts.mimeType = mimeType;
+  try {
+    recorder = new MediaRecorder(mixed, opts);
+  } catch (e) {
+    console.warn(e);
+    recorder = new MediaRecorder(mixed);
+  }
+  chunks = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size) chunks.push(e.data);
+  };
+  recorder.onstop = () => {
+    canvasStream.getVideoTracks().forEach((t) => t.stop());
+    const type = (recorder.mimeType || mimeType || 'video/webm').split(';')[0];
+    showResult(new Blob(chunks, { type }));
+  };
+  recorder.start(1000);
+  recording = true;
+  recStart = performance.now();
+  $('recBadge').classList.remove('hidden');
+  $('recTime').textContent = '00:00';
+  recTimer = setInterval(() => {
+    $('recTime').textContent = fmtTime((performance.now() - recStart) / 1000);
+  }, 250);
+  if (settings.autoScroll) setPlaying(true);
+}
+
+function stopRecording() {
+  document.body.classList.remove('recording');
+  $('btnRecord').classList.remove('recording');
+  $('countdown').classList.add('hidden');
+  countingDown = false;
+  clearInterval(recTimer);
+  $('recBadge').classList.add('hidden');
+  setPlaying(false);
+  if (recorder && recorder.state !== 'inactive') recorder.stop();
+  recording = false;
+}
+
+$('btnRecord').onclick = () => {
+  if (recording || countingDown) stopRecording();
+  else startRecording();
+};
+
+// ---------- 録画結果・保存 ----------
+function showResult(blob) {
+  if (resultUrl) URL.revokeObjectURL(resultUrl);
+  resultBlob = blob;
+  resultUrl = URL.createObjectURL(blob);
+  const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+  resultName = `kanpe-${fileStamp()}.${ext}`;
+  const v = $('resultVideo');
+  v.src = resultUrl;
+  $('resultInfo').textContent = `${(blob.size / 1024 / 1024).toFixed(1)} MB / ${ext.toUpperCase()}`;
+  $('result').classList.remove('hidden');
+  updateCanvasSize();
+}
+
+$('btnShare').onclick = async () => {
+  if (!resultBlob) return;
+  const file = new File([resultBlob], resultName, { type: resultBlob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: resultName });
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      console.warn(e);
+    }
+  }
+  download();
+};
+$('btnDownload').onclick = () => download();
+function download() {
+  if (!resultUrl) return;
+  const a = document.createElement('a');
+  a.href = resultUrl;
+  a.download = resultName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast('ダウンロードを開始しました');
+}
+$('btnRetake').onclick = () => {
+  const v = $('resultVideo');
+  v.pause();
+  $('result').classList.add('hidden');
+};
+
+// ---------- 画面スリープ防止 ----------
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch {
+    /* 非対応 */
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && stream) requestWakeLock();
+});
+window.addEventListener('beforeunload', (e) => {
+  if (recording) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// ---------- 画面の向き ----------
+let resizeTimer = null;
+function onResize() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(updateCanvasSize, 150);
+}
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', onResize);
+
+// ---------- 起動 ----------
+$('btnStart').onclick = async () => {
+  $('startError').textContent = '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('startError').textContent =
+      'このブラウザではカメラを使えません。HTTPSで開いているか、Safari / Chrome の最新版か確認してください。';
+    return;
+  }
+  try {
+    await startCamera();
+    $('start').classList.add('hidden');
+    requestWakeLock();
+    if (settings.bgMode !== 'none') {
+      ensureSegmenter().then((s) => {
+        if (!s) {
+          settings.bgMode = 'none';
+          saveSettings();
+        }
+      });
+    }
+  } catch (e) {
+    console.error(e);
+    $('startError').textContent =
+      e && e.name === 'NotAllowedError'
+        ? 'カメラ/マイクへのアクセスが拒否されました。ブラウザの設定から許可してください。'
+        : `カメラを起動できませんでした (${(e && e.name) || e})`;
+  }
+};
+
+applyPrompterStyle();
+renderScript();
+updateSpeedLabel();
+syncSettingsUI();
+updateCanvasSize();
+requestAnimationFrame(render);

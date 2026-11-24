@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="カンペカメラ" />
+  <title>カンペカメラ</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- 録画される映像(合成済みキャンバス) -->
+    <canvas id="stage"></canvas>
+    <video id="cam" playsinline muted autoplay></video>
+
+    <!-- カンペ -->
+    <div id="prompter" class="prompter">
+      <div id="prompterScroll" class="prompter-scroll">
+        <div id="prompterText" class="prompter-text"></div>
+      </div>
+      <div class="prompter-guide" aria-hidden="true"></div>
+      <div class="prompter-bar">
+        <button id="btnPlay" class="chip" title="カンペ再生/停止">▶</button>
+        <button id="btnTop" class="chip" title="先頭へ">⤒</button>
+        <button id="btnSlower" class="chip" title="遅く">−</button>
+        <span id="speedLabel" class="speed-label">速さ 30</span>
+        <button id="btnFaster" class="chip" title="速く">＋</button>
+        <button id="btnEdit" class="chip" title="カンペ編集">✎ 編集</button>
+      </div>
+    </div>
+
+    <!-- 録画中の表示 -->
+    <div id="recBadge" class="rec-badge hidden"><span class="dot"></span><span id="recTime">00:00</span></div>
+    <div id="countdown" class="countdown hidden"></div>
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- 操作ボタン -->
+    <div id="controls" class="controls">
+      <button id="btnSettings" class="ctrl" title="設定">⚙︎</button>
+      <button id="btnRecord" class="record" title="録画"><span></span></button>
+      <button id="btnFlip" class="ctrl" title="カメラ切替">⟲</button>
+    </div>
+
+    <!-- 起動画面 -->
+    <div id="start" class="overlay start">
+      <div class="start-inner">
+        <div class="logo">🎬</div>
+        <h1>カンペカメラ</h1>
+        <p>カンペを読みながら動画を撮影できます。<br />カメラとマイクの使用を許可してください。</p>
+        <button id="btnStart" class="primary">カメラを起動</button>
+        <p id="startError" class="error"></p>
+      </div>
+    </div>
+
+    <!-- カンペ編集 -->
+    <div id="editor" class="overlay sheet hidden">
+      <div class="sheet-inner">
+        <div class="sheet-head">
+          <h2>カンペ編集</h2>
+          <button id="btnEditDone" class="primary small">完了</button>
+        </div>
+        <textarea id="scriptInput" placeholder="ここに原稿を入力、または貼り付けてください" spellcheck="false"></textarea>
+        <div class="row wrap">
+          <button id="btnPaste" class="secondary">📋 貼り付け</button>
+          <button id="btnCopy" class="secondary">📄 コピー</button>
+          <button id="btnClear" class="secondary">🗑 クリア</button>
+          <span id="charCount" class="muted"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 設定 -->
+    <div id="settings" class="overlay sheet hidden">
+      <div class="sheet-inner">
+        <div class="sheet-head">
+          <h2>設定</h2>
+          <button id="btnSettingsDone" class="primary small">閉じる</button>
+        </div>
+
+        <h3>背景</h3>
+        <div class="seg" id="bgMode">
+          <button data-v="none">なし</button>
+          <button data-v="blur">ぼかし</button>
+          <button data-v="color">単色</button>
+          <button data-v="image">画像</button>
+        </div>
+        <div class="row" id="bgColorRow">
+          <label>背景色</label>
+          <div class="swatches" id="swatches">
+            <button data-c="#ffffff" style="background:#ffffff"></button>
+            <button data-c="#e9eef3" style="background:#e9eef3"></button>
+            <button data-c="#cfd8dc" style="background:#cfd8dc"></button>
+            <button data-c="#1e3a5f" style="background:#1e3a5f"></button>
+            <button data-c="#00b140" style="background:#00b140"></button>
+          </div>
+          <input type="color" id="bgColor" value="#ffffff" />
+        </div>
+        <div class="row" id="bgBlurRow">
+          <label for="blurAmount">ぼかしの強さ</label>
+          <input type="range" id="blurAmount" min="1" max="10" step="1" />
+          <output id="blurAmountOut"></output>
+        </div>
+        <div class="row" id="bgImageRow">
+          <label>背景画像</label>
+          <label class="secondary file-btn">画像を選択<input type="file" id="bgImage" accept="image/*" hidden /></label>
+        </div>
+        <p id="bgStatus" class="muted small-text"></p>
+
+        <h3>カンペ</h3>
+        <div class="row">
+          <label for="speed">流れる速さ</label>
+          <input type="range" id="speed" min="0" max="100" step="1" />
+          <output id="speedOut"></output>
+        </div>
+        <div class="row">
+          <label for="fontSize">文字サイズ</label>
+          <input type="range" id="fontSize" min="14" max="64" step="1" />
+          <output id="fontSizeOut"></output>
+        </div>
+        <div class="row">
+          <label for="opacity">背景の濃さ</label>
+          <input type="range" id="opacity" min="0" max="90" step="5" />
+          <output id="opacityOut"></output>
+        </div>
+        <div class="row">
+          <label for="pHeight">表示エリアの高さ</label>
+          <input type="range" id="pHeight" min="20" max="80" step="5" />
+          <output id="pHeightOut"></output>
+        </div>
+        <div class="row">
+          <label for="autoScroll">録画開始で自動スクロール</label>
+          <input type="checkbox" id="autoScroll" class="switch" />
+        </div>
+        <div class="row">
+          <label for="resetOnRec">録画開始時に先頭へ戻す</label>
+          <input type="checkbox" id="resetOnRec" class="switch" />
+        </div>
+
+        <h3>録画</h3>
+        <div class="row">
+          <label for="countdownOn">3秒カウントダウン</label>
+          <input type="checkbox" id="countdownOn" class="switch" />
+        </div>
+        <div class="row">
+          <label for="mirror">プレビューを鏡像表示</label>
+          <input type="checkbox" id="mirror" class="switch" />
+        </div>
+        <div class="row">
+          <label>画質</label>
+          <div class="seg" id="quality">
+            <button data-v="720">720p</button>
+            <button data-v="1080">1080p</button>
+          </div>
+        </div>
+        <p class="muted small-text">※ 縦持ちで録画すると縦長、横持ちで録画すると横長の動画になります。録画済みの動画は左右反転されません。</p>
+      </div>
+    </div>
+
+    <!-- 録画結果 -->
+    <div id="result" class="overlay sheet hidden">
+      <div class="sheet-inner result-inner">
+        <div class="sheet-head">
+          <h2>録画完了</h2>
+          <span id="resultInfo" class="muted"></span>
+        </div>
+        <video id="resultVideo" playsinline controls></video>
+        <div class="row wrap center">
+          <button id="btnShare" class="primary">📲 保存 / 共有</button>
+          <button id="btnDownload" class="secondary">⬇ ダウンロード</button>
+          <button id="btnRetake" class="secondary">↺ 撮り直す</button>
+        </div>
+        <p class="muted small-text">iPhone: 「保存 / 共有」→「ビデオを保存」で写真アプリに保存できます。</p>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
