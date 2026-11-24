@@ -59,6 +59,7 @@ let recTimer = null;
 let resultBlob = null;
 let resultUrl = null;
 let resultName = '';
+let resultFile = null;
 let wakeLock = null;
 let countingDown = false;
 let recordMode = '';
@@ -969,6 +970,10 @@ function showResult(blob) {
   resultUrl = URL.createObjectURL(blob);
   const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
   resultName = `kanpe-${fileStamp()}.${ext}`;
+  // 共有用ファイルは先に作っておく(ボタンを押してから時間をかけない)
+  resultFile = new File([blob], resultName, { type: ext === 'mp4' ? 'video/mp4' : 'video/webm' });
+  // 録画結果の表示中はマイクの音声処理を止める(iOSの共有シートとの干渉を避ける)
+  if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
   const v = $('resultVideo');
   v.src = resultUrl;
   $('resultInfo').textContent = `${(blob.size / 1024 / 1024).toFixed(1)} MB / ${ext.toUpperCase()} / ${recordMode === 'webcodecs' ? '安定モード' : '互換モード'}`;
@@ -977,18 +982,24 @@ function showResult(blob) {
 }
 
 $('btnShare').onclick = async () => {
-  if (!resultBlob) return;
-  const file = new File([resultBlob], resultName, { type: resultBlob.type });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: resultName });
-      return;
-    } catch (e) {
-      if (e && e.name === 'AbortError') return;
-      console.warn(e);
-    }
+  if (!resultFile) return;
+  // 押した直後に同期的に share を呼ぶ(iOSは操作から時間が空くと拒否する)
+  if (!navigator.share || !navigator.canShare) {
+    toast('この端末は共有に対応していません。「ダウンロード」を使ってください', 3500);
+    return;
   }
-  download();
+  if (!navigator.canShare({ files: [resultFile] })) {
+    toast('この形式の動画は共有できません。「ダウンロード」を使ってください', 3500);
+    return;
+  }
+  try {
+    // title などを付けると iOS で「ビデオを保存」が出ない/失敗することがあるのでファイルのみ
+    await navigator.share({ files: [resultFile] });
+  } catch (e) {
+    if (e && e.name === 'AbortError') return; // ユーザーが閉じた
+    console.warn(e);
+    toast(`共有できませんでした(${(e && e.name) || e})。もう一度押すか「ダウンロード」を使ってください`, 4500);
+  }
 };
 $('btnDownload').onclick = () => download();
 function download() {
@@ -1002,6 +1013,7 @@ function download() {
   toast('ダウンロードを開始しました');
 }
 $('btnRetake').onclick = () => {
+  if (audioCtx && audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
   const v = $('resultVideo');
   v.pause();
   $('result').classList.add('hidden');
