@@ -22,7 +22,8 @@ const DEFAULTS = {
   countdownOn: true,
   mirror: true,
   quality: '720',
-  landSide: 'left',   // 横画面でのカンペ位置: left | right
+  landSide: 'left',
+  format: 'auto',      // auto | mp4 | webm   // 横画面でのカンペ位置: left | right
 };
 
 const SAMPLE_SCRIPT = `はじめまして。〇〇大学〇〇学部の〇〇です。
@@ -60,6 +61,7 @@ let resultName = '';
 let wakeLock = null;
 let countingDown = false;
 let recordingDirect = false;
+let recordingCanvas = false;
 
 // 合成用キャンバス
 const frameCv = document.createElement('canvas');
@@ -179,8 +181,9 @@ async function startCamera() {
   const constraints = {
     video: {
       facingMode: facing,
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
+      // 画質に合わせて要求(必要以上に大きいと端末の負荷で録画が止まることがある)
+      width: { ideal: settings.quality === '1080' ? 1920 : 1280 },
+      height: { ideal: settings.quality === '1080' ? 1080 : 720 },
       frameRate: { ideal: 30 },
     },
     audio: {
@@ -202,7 +205,17 @@ async function startCamera() {
 let rvfcStarted = false;
 
 function applyMirror() {
-  stage.classList.toggle('mirror', settings.mirror && facing === 'user');
+  const m = settings.mirror && facing === 'user';
+  stage.classList.toggle('mirror', m);
+  video.classList.toggle('mirror', m);
+}
+
+// 背景なしのときはキャンバス合成をやめてカメラ映像を直接表示(端末の負荷を減らす)
+function usesCanvas() {
+  return settings.bgMode !== 'none' && !!segmenter;
+}
+function applyPreviewMode() {
+  document.body.classList.toggle('raw-preview', !usesCanvas());
 }
 
 // ---------- 背景処理 (MediaPipe) ----------
@@ -323,6 +336,7 @@ function sourceSize() {
 }
 
 function drawFrame() {
+  if (!usesCanvas() && !recordingCanvas) return;
   if (!video.videoWidth || video.readyState < 2) return;
   lastFrameDraw = performance.now();
   const W = stage.width;
@@ -533,6 +547,7 @@ function syncSettingsUI() {
   for (const k of checks) $(k).checked = !!settings[k];
   for (const b of $('bgMode').children) b.classList.toggle('active', b.dataset.v === settings.bgMode);
   for (const b of $('landSide').children) b.classList.toggle('active', b.dataset.v === settings.landSide);
+  for (const b of $('format').children) b.classList.toggle('active', b.dataset.v === settings.format);
   for (const b of $('quality').children) b.classList.toggle('active', b.dataset.v === settings.quality);
   $('bgColor').value = settings.bgColor;
   $('bgColorRow').classList.toggle('hidden', !(settings.bgMode === 'color' || settings.bgMode === 'image'));
@@ -574,6 +589,7 @@ $('bgMode').addEventListener('click', async (e) => {
       syncSettingsUI();
     }
   }
+  applyPreviewMode();
 });
 function applyLandSide() {
   document.body.classList.toggle('p-right', settings.landSide === 'right');
@@ -597,6 +613,14 @@ $('quality').addEventListener('click', (e) => {
   saveSettings();
   syncSettingsUI();
   updateCanvasSize();
+  if (stream) startCamera().catch((err) => console.warn(err));
+});
+$('format').addEventListener('click', (e) => {
+  const v = e.target.dataset && e.target.dataset.v;
+  if (!v || recording) return;
+  settings.format = v;
+  saveSettings();
+  syncSettingsUI();
 });
 $('swatches').addEventListener('click', (e) => {
   const c = e.target.dataset && e.target.dataset.c;
@@ -648,17 +672,18 @@ $('btnFlip').onclick = async () => {
 };
 
 // ---------- 録画 ----------
+const MP4_TYPES = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a', 'video/mp4'];
+const WEBM_TYPES = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm'];
 function pickMimeType() {
   if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
-  const list = [
-    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
-    'video/mp4;codecs=avc1,mp4a',
-    'video/mp4',
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm',
-  ];
-  return list.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  const ok = (t) => MediaRecorder.isTypeSupported(t);
+  const webm = WEBM_TYPES.find(ok);
+  const mp4 = MP4_TYPES.find(ok);
+  if (settings.format === 'mp4') return mp4 || webm || '';
+  if (settings.format === 'webm') return webm || mp4 || '';
+  // 自動: WebM が使えるブラウザ(Chrome/Android等)は安定している WebM、
+  // 使えないブラウザ(iPhone Safari等)は MP4
+  return webm || mp4 || '';
 }
 
 async function runCountdown() {
@@ -688,14 +713,15 @@ async function startRecording() {
 
   // 背景なし: カメラ映像をそのまま録画(最も安定)
   // 背景あり: 合成したキャンバスを録画
-  const direct = settings.bgMode === 'none' || !segmenter;
+  const direct = !usesCanvas();
+  recordingCanvas = !direct;
   const canvasStream = direct ? null : stage.captureStream(30);
   const videoTracks = direct ? stream.getVideoTracks() : canvasStream.getVideoTracks();
   const mixed = new MediaStream([...videoTracks, ...stream.getAudioTracks()]);
   recordingDirect = direct;
   const mimeType = pickMimeType();
   const opts = {
-    videoBitsPerSecond: settings.quality === '1080' ? 8_000_000 : 5_000_000,
+    videoBitsPerSecond: settings.quality === '1080' ? 6_000_000 : 3_500_000,
     audioBitsPerSecond: 128_000,
   };
   if (mimeType) opts.mimeType = mimeType;
@@ -712,7 +738,13 @@ async function startRecording() {
   recorder.onstop = () => {
     if (canvasStream) canvasStream.getVideoTracks().forEach((t) => t.stop());
     const type = (recorder.mimeType || mimeType || 'video/webm').split(';')[0];
-    showResult(new Blob(chunks, { type }));
+    const blob = new Blob(chunks, { type });
+    const durMs = performance.now() - recStart;
+    if (type.includes('webm')) {
+      fixWebmDuration(blob, durMs).then(showResult, () => showResult(blob));
+    } else {
+      showResult(blob);
+    }
   };
   recorder.start();
   recording = true;
@@ -735,12 +767,80 @@ function stopRecording() {
   setPlaying(false);
   if (recorder && recorder.state !== 'inactive') recorder.stop();
   recording = false;
+  recordingCanvas = false;
 }
 
 $('btnRecord').onclick = () => {
   if (recording || countingDown) stopRecording();
   else startRecording();
 };
+
+// ---------- WebM に再生時間を書き込む ----------
+// Chrome の WebM は Duration が無く、再生アプリでシークできない/長さが表示されないため補う
+async function fixWebmDuration(blob, durationMs) {
+  const headLen = Math.min(blob.size, 256 * 1024);
+  const buf = new Uint8Array(await blob.slice(0, headLen).arrayBuffer());
+  const readVint = (pos, keepMarker) => {
+    const first = buf[pos];
+    let len = 1;
+    while (len <= 8 && !(first & (0x80 >> (len - 1)))) len++;
+    if (len > 8) throw new Error('bad vint');
+    let val = keepMarker ? first : first & (0xff >> len);
+    let unknown = val === (0xff >> len) && !keepMarker;
+    for (let i = 1; i < len; i++) {
+      val = val * 256 + buf[pos + i];
+      if (buf[pos + i] !== 0xff) unknown = false;
+    }
+    return { val, len, unknown };
+  };
+  let pos = 0;
+  // EBML ヘッダ
+  let id = readVint(pos, true);
+  if (id.val !== 0x1a45dfa3) return blob;
+  let size = readVint(pos + id.len, false);
+  pos += id.len + size.len + size.val;
+  // Segment
+  id = readVint(pos, true);
+  if (id.val !== 0x18538067) return blob;
+  size = readVint(pos + id.len, false);
+  if (!size.unknown) return blob; // サイズ確定済みの形式は対象外
+  pos += id.len + size.len;
+  while (pos < buf.length - 12) {
+    id = readVint(pos, true);
+    size = readVint(pos + id.len, false);
+    const dataStart = pos + id.len + size.len;
+    if (id.val === 0x114d9b74) return blob; // SeekHead があると位置がずれるので触らない
+    if (id.val === 0x1549a966) {
+      // Info
+      const dataEnd = dataStart + size.val;
+      if (dataEnd > buf.length) return blob;
+      let p = dataStart;
+      while (p < dataEnd) {
+        const cid = readVint(p, true);
+        const csz = readVint(p + cid.len, false);
+        if (cid.val === 0x4489) return blob; // 既に Duration あり
+        p += cid.len + csz.len + csz.val;
+      }
+      const body = buf.slice(dataStart, dataEnd);
+      const dur = new Uint8Array(11);
+      dur[0] = 0x44; dur[1] = 0x89; dur[2] = 0x88;
+      new DataView(dur.buffer).setFloat64(3, durationMs); // TimecodeScale=1ms 前提
+      const newSize = body.length + dur.length;
+      const sizeBytes = new Uint8Array(8);
+      sizeBytes[0] = 0x01;
+      let v = newSize;
+      for (let i = 7; i >= 1; i--) { sizeBytes[i] = v & 0xff; v = Math.floor(v / 256); }
+      const header = buf.slice(pos, pos + id.len);
+      return new Blob(
+        [blob.slice(0, pos), header, sizeBytes, body, dur, blob.slice(dataEnd)],
+        { type: blob.type },
+      );
+    }
+    if (size.unknown) return blob;
+    pos = dataStart + size.val;
+  }
+  return blob;
+}
 
 // ---------- 録画結果・保存 ----------
 function showResult(blob) {
@@ -854,6 +954,7 @@ $('btnStart').onclick = async () => {
           settings.bgMode = 'none';
           saveSettings();
         }
+        applyPreviewMode();
       });
     }
   } catch (e) {
@@ -867,6 +968,7 @@ $('btnStart').onclick = async () => {
 
 applyPrompterStyle();
 applyLandSide();
+applyPreviewMode();
 renderScript();
 updateSpeedLabel();
 syncSettingsUI();

@@ -36,7 +36,9 @@ button { font: inherit; color: inherit; cursor: pointer; }
   background: #000;
   z-index: 1;
 }
-#stage.mirror { transform: scaleX(-1); }
+#stage.mirror, #cam.mirror { transform: scaleX(-1); }
+/* 背景なし: カメラ映像を直接表示 */
+body.raw-preview #stage { visibility: hidden; }
 
 /* iOSでは見えていない<video>はフレーム更新が止まるため、
    キャンバスの真後ろに全画面で表示しておく(キャンバスで隠れる) */
